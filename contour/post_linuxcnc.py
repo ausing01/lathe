@@ -29,14 +29,41 @@ class PostConfig:
     tool: int = 1                 # tool number; offset assumed = tool number
     safe_z: float = 0.15          # rapid clearance in front of the face
     retract_r: float = 2.85       # radius to pull out to at end (clear of part)
-    approach_gap: float = 0.0015  # how far in front of the face to begin feed
     program_name: str = "PART"
 
 
 def _fmt(v):
-    """Format a coordinate: strip trailing zeros but keep it readable."""
-    s = f"{v:.4f}".rstrip("0").rstrip(".")
-    return s if s not in ("", "-0") else "0"
+    """
+    Format a coordinate word.
+
+    ALWAYS keeps a trailing decimal point. On many controls (Fanuc especially)
+    a value with no decimal is read in the control's least increment, so a bare
+    'Z-4' means -0.0004", not -4". Emitting 'Z-4.' is the safe convention and
+    matches standard practice. Trailing zeros after the point are stripped for
+    readability, but the point itself is never dropped.
+      -4.0    -> "-4."
+      -1.276  -> "-1.276"
+      0.0     -> "0."
+      1.6737  -> "1.6737"
+    """
+    s = f"{v:.4f}"
+    if "." in s:
+        s = s.rstrip("0")          # trim trailing zeros
+        if s.endswith("."):
+            pass                    # keep the bare point, e.g. "-4."
+    # normalise negative zero
+    if s in ("-0.", "-0"):
+        s = "0."
+    return s
+
+
+def _ifmt(v):
+    """
+    Format a NON-positional word (spindle S, rpm clamp D). These are integer
+    quantities, not axis coordinates, so they get no decimal point - some
+    controls reject a decimal on an S word. Rounded to whole units.
+    """
+    return str(int(round(v)))
 
 
 def _x(r, cfg):
@@ -63,24 +90,25 @@ def post_finish(contour, cfg, out=None):
     emit("G40 G54")                              # comp off, work offset
     emit("G95")                                  # feed per revolution
     if cfg.css:
-        emit(f"G96 D{_fmt(cfg.css_max_rpm)} S{_fmt(cfg.surface_speed)} M3")
+        emit(f"G96 D{_ifmt(cfg.css_max_rpm)} S{_ifmt(cfg.surface_speed)} M3")
     else:
-        emit(f"G97 S{_fmt(cfg.rpm)} M3")
+        emit(f"G97 S{_ifmt(cfg.rpm)} M3")
     if cfg.coolant:
         emit("M8")
     emit()
 
     # approach -------------------------------------------------------------
-    # rapid clear of the part, then to just in front of the start point
+    # Stage the approach so we never rapid close to the face:
+    #   1. rapid clear of the part at the safe Z standoff
+    #   2. rapid to the start X, STILL holding the safe Z (no diving to the face)
+    #   3. feed axially from the standoff onto the start point
     emit(f"G0 X{_fmt(_x(contour.r_range()[1] + 0.05, cfg))} "
          f"Z{_fmt(cfg.safe_z)}")
-    emit(f"G0 X{_fmt(_x(r_start.r, cfg))} "
-         f"Z{_fmt(r_start.z + cfg.approach_gap)}")
+    emit(f"G0 X{_fmt(_x(r_start.r, cfg))} Z{_fmt(cfg.safe_z)}")
 
     # contour --------------------------------------------------------------
     emit("(--- contour ---)")
-    first_feed = True
-    # feed onto the start point
+    # feed from the safe standoff onto the start point (Z of the first element)
     emit(f"G1 Z{_fmt(r_start.z)} F{_fmt(cfg.feed_per_rev)}")
     for e in contour.elements:
         if e.kind == "line":
@@ -97,7 +125,7 @@ def post_finish(contour, cfg, out=None):
     if cfg.coolant:
         emit("M9")
     emit("M5")
-    emit("G53 G0 X0 Z0")
+    emit(f"G53 G0 X{_fmt(0.0)} Z{_fmt(0.0)}")
     emit("M2")
 
     text = "\n".join(L) + "\n"
