@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# generated G-code output (keep sources, not build artifacts)
+*_out.ngc
+
+# editor noise
+*.swp
+*~
+.vscode/
