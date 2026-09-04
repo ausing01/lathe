@@ -51,6 +51,7 @@ class Line:
     """A straight segment from start to end (both in part coords)."""
     start: Point
     end: Point
+    source_id: int = None   # index of the DXF entity this came from (or None)
 
     @property
     def kind(self):
@@ -67,6 +68,7 @@ class Arc:
     end: Point
     center: Point
     direction: ArcDir
+    source_id: int = None   # index of the DXF entity this came from (or None)
 
     @property
     def kind(self):

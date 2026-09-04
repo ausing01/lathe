@@ -73,16 +73,17 @@ def offset_arc_radius(radius, distance, concave):
     Offset an arc's radius. For a tool rolling on the profile:
       concave arc  -> radius grows by the nose radius   (R + d)
       convex arc   -> radius shrinks by the nose radius (R - d)
-    `distance` is the nose radius (positive). Returns the new radius.
-    Raises if a convex arc would invert (feature tighter than the tool).
+    `distance` is the nose radius (positive).
+
+    Returns the new radius, or None if a convex arc is smaller than the offset
+    (the tool cannot fit this feature - the element "vanishes" from the tool
+    path and the caller must bridge across it by intersecting its neighbours).
     """
     if concave:
         return radius + distance
     new_r = radius - distance
     if new_r < TOL:
-        raise ValueError(
-            f"convex arc R{radius:.4f} smaller than offset {distance:.4f} "
-            f"- tool cannot fit this feature")
+        return None            # element vanishes; caller bridges across it
     return new_r
 
 
@@ -195,12 +196,9 @@ def _selftest():
     check("convex R0.15 -> 0.11875",
           _approx(offset_arc_radius(0.15, NOSE, concave=False), 0.11875))
 
-    # convex arc smaller than nose radius should raise
-    try:
-        offset_arc_radius(0.02, NOSE, concave=False)
-        check("convex-too-small raises", False)
-    except ValueError:
-        check("convex-too-small raises", True)
+    # convex arc smaller than nose radius should signal a vanished element
+    check("convex-too-small -> None",
+          offset_arc_radius(0.02, NOSE, concave=False) is None)
 
     # line/line intersection
     p = intersect_line_line((0, 0), (1, 0), (0, 1), (1, 1))

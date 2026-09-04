@@ -60,25 +60,27 @@ def _num(entity, code, idx=0, default=None):
 # arcs carry direction that flips when reversed.
 
 class _RawSeg:
-    __slots__ = ("kind", "a", "b", "center", "r", "ccw")
+    __slots__ = ("kind", "a", "b", "center", "r", "ccw", "entity_id")
 
-    def __init__(self, kind, a, b, center=None, r=None, ccw=None):
+    def __init__(self, kind, a, b, center=None, r=None, ccw=None,
+                 entity_id=None):
         self.kind = kind
         self.a = a            # (x, y) start in DXF coords
         self.b = b            # (x, y) end
         self.center = center  # (x, y) for arcs
         self.r = r
         self.ccw = ccw        # DXF arcs are always CCW from start_ang to end_ang
+        self.entity_id = entity_id  # index into the DXF entity list (identity hook)
 
 
 def _raw_segments(entities):
     segs = []
-    for e in entities:
+    for idx, e in enumerate(entities):
         t = e["type"]
         if t == "LINE":
             a = (_num(e, "10"), _num(e, "20"))
             b = (_num(e, "11"), _num(e, "21"))
-            segs.append(_RawSeg("line", a, b))
+            segs.append(_RawSeg("line", a, b, entity_id=idx))
         elif t == "ARC":
             cx, cy = _num(e, "10"), _num(e, "20")
             r = _num(e, "40")
@@ -87,7 +89,8 @@ def _raw_segments(entities):
             a = (cx + r * math.cos(sa), cy + r * math.sin(sa))
             b = (cx + r * math.cos(ea), cy + r * math.sin(ea))
             # DXF arcs always sweep CCW from start angle to end angle
-            segs.append(_RawSeg("arc", a, b, center=(cx, cy), r=r, ccw=True))
+            segs.append(_RawSeg("arc", a, b, center=(cx, cy), r=r, ccw=True,
+                                entity_id=idx))
     return segs
 
 
@@ -101,74 +104,120 @@ def _dist(p, q):
 
 def build_chain(segs, tol=1e-3, start_hint=None):
     """
-    Order the segments into a single connected walk.
+    Order the segments into a connected walk using true endpoint CONNECTIVITY.
 
-    tol: two endpoints within this distance are treated as the same point.
-    start_hint: optional (x,y); the endpoint nearest this becomes the chain
-                start. Handy to force a known starting end (e.g. the face).
+    Unlike a greedy nearest-neighbour walk (which will happily invent a
+    connection across a gap to whatever endpoint is closest), this builds a
+    node graph: endpoints within `tol` of each other are the same node, and
+    each segment is an edge between two nodes. The walk then follows only real
+    edges - it never bridges a gap that has no entity across it.
 
-    Returns (ordered_segs, problems). Each ordered seg is oriented so its
-    .a flows into the next seg's .a. Arcs get their .ccw flag flipped when
-    the segment is walked in reverse.
+    Returns (ordered_segs, problems):
+      - segments are oriented so each .b flows into the next .a
+      - reversed segments keep their entity_id and flip arc direction
+      - problems flags gaps, branches (a node with >2 edges), and any segments
+        left unconnected (a separate chain / stray entity)
+
+    start_hint (x,y), optional: of the two natural chain ends, start from the
+    one nearer this point. Default (origin) picks the end nearest the face.
     """
     problems = []
-    remaining = list(segs)
+    if not segs:
+        return [], ["no segments to chain"]
 
-    # choose a starting segment/endpoint
-    if start_hint is not None:
-        # find the endpoint (over all segs) closest to the hint
-        best = None
-        for idx, s in enumerate(remaining):
-            for end, pt in (("a", s.a), ("b", s.b)):
-                d = _dist(pt, start_hint)
-                if best is None or d < best[0]:
-                    best = (d, idx, end)
-        _, idx, end = best
-        first = remaining.pop(idx)
-        if end == "b":
-            first = _reverse(first)
-    else:
-        first = remaining.pop(0)
+    # --- 1. cluster endpoints into nodes -------------------------------------
+    # node_of[(seg_index, 'a'|'b')] = node id
+    nodes = []                 # list of representative (x, y) points
+    node_of = {}
 
-    chain = [first]
-    cursor = first.b  # the open end we need to extend from
+    def node_for(pt):
+        for nid, npt in enumerate(nodes):
+            if _dist(pt, npt) <= tol:
+                return nid
+        nodes.append(pt)
+        return len(nodes) - 1
 
-    while remaining:
-        # find the segment whose nearest endpoint is closest to cursor
-        best = None
-        for idx, s in enumerate(remaining):
-            da, db = _dist(s.a, cursor), _dist(s.b, cursor)
-            d, end = (da, "a") if da <= db else (db, "b")
-            if best is None or d < best[0]:
-                best = (d, idx, end)
+    # adjacency: node id -> list of (seg_index, which_end_is_here)
+    adj = {}
+    for i, s in enumerate(segs):
+        na = node_for(s.a)
+        nb = node_for(s.b)
+        node_of[(i, "a")] = na
+        node_of[(i, "b")] = nb
+        adj.setdefault(na, []).append((i, "a"))
+        adj.setdefault(nb, []).append((i, "b"))
 
-        d, idx, end = best
-        nxt = remaining.pop(idx)
-        if end == "b":
-            nxt = _reverse(nxt)
+    # --- 2. classify nodes ---------------------------------------------------
+    # degree 1 = a free end; degree 2 = normal interior; >2 = a branch
+    ends = [nid for nid, lst in adj.items() if len(lst) == 1]
+    branches = [nid for nid, lst in adj.items() if len(lst) > 2]
+    for nid in branches:
+        problems.append(
+            f"branch at ({nodes[nid][0]:.4f},{nodes[nid][1]:.4f}): "
+            f"{len(adj[nid])} segments meet here - profile is not a simple chain")
 
-        if d > tol:
-            problems.append(
-                f"gap of {d:.5f} bridged between "
-                f"({cursor[0]:.4f},{cursor[1]:.4f}) and "
-                f"({nxt.a[0]:.4f},{nxt.a[1]:.4f})"
-            )
-            # snap: move this segment's start exactly onto the cursor so the
-            # resulting contour is continuous. The far end is left as drawn.
-            nxt = _snap_start(nxt, cursor)
+    # --- 3. choose a start segment/end --------------------------------------
+    used = [False] * len(segs)
 
-        chain.append(nxt)
-        cursor = nxt.b
+    def start_end_node():
+        # prefer a true free end; of the (usually two) ends, pick nearest hint
+        if ends:
+            if start_hint is not None:
+                return min(ends, key=lambda n: _dist(nodes[n], start_hint))
+            return ends[0]
+        # no free end => closed loop; start at the node nearest the hint
+        if start_hint is not None:
+            return min(adj.keys(), key=lambda n: _dist(nodes[n], start_hint))
+        return next(iter(adj.keys()))
+
+    # --- 4. walk the chain ---------------------------------------------------
+    chain = []
+    start_node = start_end_node()
+    # pick the (unused) segment leaving the start node
+    cur_seg, cur_end = adj[start_node][0]
+    cur_node = start_node
+
+    while True:
+        s = segs[cur_seg]
+        used[cur_seg] = True
+        # orient so it leaves cur_node: if this seg's 'a' is at cur_node keep it,
+        # else reverse it
+        if node_of[(cur_seg, "a")] == cur_node:
+            oriented = s
+            far_node = node_of[(cur_seg, "b")]
+        else:
+            oriented = _reverse(s)
+            far_node = node_of[(cur_seg, "a")]
+        chain.append(oriented)
+
+        # find the next unused segment at far_node
+        nxt = None
+        for (si, se) in adj.get(far_node, []):
+            if not used[si]:
+                nxt = si
+                break
+        if nxt is None:
+            break
+        cur_seg = nxt
+        cur_node = far_node
+
+    # --- 5. report anything we didn't reach ---------------------------------
+    unused = [i for i, u in enumerate(used) if not u]
+    if unused:
+        problems.append(
+            f"{len(unused)} segment(s) not connected to the main chain "
+            f"(entity ids {[segs[i].entity_id for i in unused]}) - "
+            f"separate contour or stray geometry")
 
     return chain, problems
 
 
 def _reverse(seg):
     if seg.kind == "line":
-        return _RawSeg("line", seg.b, seg.a)
+        return _RawSeg("line", seg.b, seg.a, entity_id=seg.entity_id)
     # reversing an arc flips its sweep direction
     return _RawSeg("arc", seg.b, seg.a, center=seg.center, r=seg.r,
-                   ccw=not seg.ccw)
+                   ccw=not seg.ccw, entity_id=seg.entity_id)
 
 
 def _snap_start(seg, new_a):
@@ -214,13 +263,13 @@ def import_dxf(path, side=Side.OD, tol=1e-3, start_hint=None, name=None):
     for s in chain:
         a, b = _to_part(s.a), _to_part(s.b)
         if s.kind == "line":
-            elements.append(Line(a, b))
+            elements.append(Line(a, b, source_id=s.entity_id))
         else:
             center = _to_part(s.center)
             # DXF ccw in (x,y) maps directly to ccw in (z,r) since the
             # transform is identity-orientation (z=x, r=y). Post decides G2/G3.
             direction = ArcDir.CCW if s.ccw else ArcDir.CW
-            elements.append(Arc(a, b, center, direction))
+            elements.append(Arc(a, b, center, direction, source_id=s.entity_id))
 
     contour = Contour(elements=elements, side=side,
                       name=name or "imported")
