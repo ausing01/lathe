@@ -273,5 +273,11 @@ def import_dxf(path, side=Side.OD, tol=1e-3, start_hint=None, name=None):
 
     contour = Contour(elements=elements, side=side,
                       name=name or "imported")
+    # closed if the chain's last endpoint returns to its first
+    if elements:
+        a = elements[0].start
+        b = elements[-1].end
+        contour.closed = (abs(a.z - b.z) <= max(tol, 1e-9) and
+                          abs(a.r - b.r) <= max(tol, 1e-9))
     problems += contour.check_continuity(tol=max(tol, 1e-4))
     return contour, problems

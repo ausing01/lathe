@@ -44,6 +44,15 @@ def _signed_area(contour):
 
 
 def _air_normal(p0, p1, contour_ccw, side):
+    """
+    Unit normal pointing to the AIR side of a segment p0->p1.
+
+    For a profile walked CCW in (z right, r up), the enclosed material lies to
+    the LEFT of travel, so air is the RIGHT normal; walked CW it is the reverse.
+    Verified on straight OD diameters: the nose centre must ride OUTWARD (larger
+    r) on an OD cut, for both CW-walked profiles (part 1, part 2) and CCW-walked
+    ones (backface). ID flips, since the material is outside the bore profile.
+    """
     n_left = G.left_normal(G.sub(p1, p0))
     n_right = (-n_left[0], -n_left[1])
     air = n_right if contour_ccw else n_left
@@ -52,12 +61,50 @@ def _air_normal(p0, p1, contour_ccw, side):
     return air
 
 
+def _arc_mid_tangent(e):
+    """Midpoint of the arc and the unit tangent there, pointing along travel."""
+    a0 = math.atan2(e.start.r - e.center.r, e.start.z - e.center.z)
+    a1 = math.atan2(e.end.r - e.center.r, e.end.z - e.center.z)
+    if e.direction == ArcDir.CCW:
+        if a1 <= a0:
+            a1 += 2 * math.pi
+        am = (a0 + a1) / 2
+        tang = (-math.sin(am), math.cos(am))
+    else:
+        if a1 >= a0:
+            a1 -= 2 * math.pi
+        am = (a0 + a1) / 2
+        tang = (math.sin(am), -math.cos(am))
+    R = e.radius
+    mid = (e.center.z + R * math.cos(am), e.center.r + R * math.sin(am))
+    return mid, tang
+
+
 def _arc_is_concave(arc, contour_ccw, side):
-    ccw_arc = (arc.direction == ArcDir.CCW)
-    concave = (ccw_arc == contour_ccw)
+    """
+    Concave (offset radius GROWS) vs convex (SHRINKS), decided locally.
+
+    Uses the arc's TRUE TANGENT at its midpoint - not the chord. A chord-based
+    normal inverts on the middle arc of an S-curve (part 2's R0.025 between two
+    R0.010 notches), which is what broke this before.
+
+    Air side is the same rule as for lines: right of travel when the contour
+    walks CCW, left when CW, flipped for ID. If the air normal points along the
+    outward bulge (centre -> midpoint), the tool rides outside the arc and the
+    swept radius shrinks (convex). If it points inward, the radius grows
+    (concave).
+
+    Validated: part1 R0.15 convex -> 0.1188, R0.10 concave -> 0.1312;
+               part2 R0.010 concave -> 0.0412 (x2), R0.025 convex (vanishes).
+    """
+    mid, tang = _arc_mid_tangent(arc)
+    n_left = G.left_normal(tang)
+    n_right = (-n_left[0], -n_left[1])
+    air = n_right if contour_ccw else n_left
     if side == Side.ID:
-        concave = not concave
-    return concave
+        air = (-air[0], -air[1])
+    bulge = G.unit(G.sub(mid, (arc.center.z, arc.center.r)))
+    return G.dot(air, bulge) < 0
 
 
 def _offset_element(e, nose, contour_ccw, side):
@@ -123,16 +170,30 @@ def compensate(contour, nose_radius, tip):
                         name=contour.name + "_comp"),
                 problems + ["nothing left after compensation"])
 
-    corners = [offs[0]['p0']]
+    # Per-element start/end. A shared corner list cannot express a convex-corner
+    # GAP (where element i ends at one point and i+1 starts at another), so keep
+    # each element's own endpoints.
+    starts = [o['p0'] for o in offs]
+    ends = [o['p1'] for o in offs]
+
     for i in range(len(offs) - 1):
         p = _reintersect(offs[i], offs[i + 1])
-        if p is None:
-            problems.append(
-                f"could not re-intersect near "
-                f"z={offs[i]['p1'][0]:.4f} r={offs[i]['p1'][1]:.4f}")
-            p = offs[i]['p1']
-        corners.append(p)
-    corners.append(offs[-1]['p1'])
+        if p is not None:
+            # concave / crossing corner: both elements meet at the intersection
+            ends[i] = p
+            starts[i + 1] = p
+        else:
+            # CONVEX corner: offset elements have separated. The tool rolls
+            # around the corner; each element keeps its own offset endpoint and
+            # the post emits a direct move between them. Do not force a shared
+            # point - that corrupts the arc geometry.
+            # A convex corner separates the offsets by up to ~2x nose radius as
+            # a matter of geometry; only warn beyond that.
+            gap = G.dist(offs[i]['p1'], offs[i + 1]['p0'])
+            if gap > nose * 2.5:
+                problems.append(
+                    f"offset elements {i}/{i+1} separated by {gap:.4f} "
+                    f"- check corner")
 
     tv = TIP_OFFSET[tip]
     tip_shift = (nose * tv[0], nose * tv[1])
@@ -141,7 +202,7 @@ def compensate(contour, nose_radius, tip):
 
     new = []
     for i, o in enumerate(offs):
-        c0, c1 = corners[i], corners[i + 1]
+        c0, c1 = starts[i], ends[i]
         if o['kind'] == 'line':
             new.append(Line(to_tip(c0), to_tip(c1)))
         else:

@@ -52,6 +52,7 @@ class Line:
     start: Point
     end: Point
     source_id: int = None   # index of the DXF entity this came from (or None)
+    origin: str = None      # None = real DXF element, "extension", "bridge"
 
     @property
     def kind(self):
@@ -69,6 +70,7 @@ class Arc:
     center: Point
     direction: ArcDir
     source_id: int = None   # index of the DXF entity this came from (or None)
+    origin: str = None      # None = real DXF element, "extension", "bridge"
 
     @property
     def kind(self):
@@ -142,3 +144,55 @@ class Contour:
                            f"({e.end.z:+.4f},{e.end.r:.4f})  "
                            f"R{e.radius:.4f} {e.direction.value}")
         return "\n".join(out)
+
+
+def element_properties(e, index=None):
+    """
+    Human-readable characteristics of one element, for display.
+
+    Angles are degrees measured from +Z toward +R. Lengths are true lengths in
+    the (z, r) plane. X values are DIAMETER, since that is what gets programmed;
+    r values are radius, as stored.
+    """
+    d = {
+        "index": index,
+        "kind": e.kind,
+        "source_id": e.source_id,
+        "synthetic": e.source_id is None,
+        "origin": e.origin,
+        "start_z": e.start.z, "start_r": e.start.r, "start_x": 2 * e.start.r,
+        "end_z": e.end.z, "end_r": e.end.r, "end_x": 2 * e.end.r,
+    }
+    if e.kind == "line":
+        dz = e.end.z - e.start.z
+        dr = e.end.r - e.start.r
+        d["length"] = math.hypot(dz, dr)
+        d["angle"] = math.degrees(math.atan2(dr, dz))
+        d["dz"] = dz
+        d["dr"] = dr
+        # Angle off the spindle axis is what gets read off a print: 0 for a
+        # straight diameter, 90 for a face, 45 for a 45-degree chamfer.
+        # Included angle is the full cone, i.e. twice that.
+        off_axis = math.degrees(math.atan2(abs(dr), abs(dz)))
+        d["angle_from_axis"] = off_axis
+        d["included_angle"] = 2 * off_axis
+    else:
+        d["radius"] = e.radius
+        d["center_z"] = e.center.z
+        d["center_r"] = e.center.r
+        d["center_x"] = 2 * e.center.r
+        d["direction"] = e.direction.value
+        a0 = math.atan2(e.start.r - e.center.r, e.start.z - e.center.z)
+        a1 = math.atan2(e.end.r - e.center.r, e.end.z - e.center.z)
+        if e.direction == ArcDir.CCW:
+            while a1 <= a0:
+                a1 += 2 * math.pi
+        else:
+            while a1 >= a0:
+                a1 -= 2 * math.pi
+        sweep = a1 - a0
+        d["start_angle"] = math.degrees(a0)
+        d["end_angle"] = math.degrees(a1)
+        d["sweep"] = math.degrees(sweep)
+        d["length"] = abs(sweep) * e.radius
+    return d

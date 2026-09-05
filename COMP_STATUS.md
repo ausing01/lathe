@@ -1,39 +1,41 @@
-# comp.py status - VALIDATED across 4 operations
+# comp.py status - ARC CONCAVITY REBUILD PENDING (known regression)
 
-## Result: nose-radius comp math proven exact against all four references
-Fed a correctly-ordered contour, comp reproduces the CAM toolpath to 4 decimals:
+## Current state: verify.py is RED on the two arc parts
+The chain-builder fix (last session) changed element ordering/direction to the
+CORRECT tight-tolerance chaining. comp's arc concave/convex test was written
+against the OLD (loose-tolerance) ordering and is now wrong for arcs.
 
-| part      | side | tip | nose    | result                          |
-|-----------|------|-----|---------|---------------------------------|
-| part 1    | OD   | #3  | 0.03125 | matches (cut portion)           |
-| part 2    | OD   | #3  | 0.03125 | matches; flags the un-fittable  |
-|           |      |     |         | R0.010 corners (correct)        |
-| bore      | ID   | #6  | 0.0886  | EXACT, all points               |
-| backface  | OD   | #8  | 0.0886  | EXACT key points when ordered   |
+verify.py reports:
+  - part1 comp arc radii [0.0688, 0.1813], want [0.1188, 0.1312]
+  - part2 comp arcs [0.0562], want an R~0.0412
+Both are the SAME bug: `_arc_is_concave` uses global contour winding, which only
+worked by coincidence for the old ordering. Concavity is a LOCAL property.
 
-One general code path handles OD/ID, four tip orientations, two nose radii.
+IMPORTANT: this regression is already in the committed repo (it went in with the
+chain-builder commit, before verify.py existed to catch it). The line-only parts
+(bore, backface) are unaffected and remain correct.
 
-## What's proven
-- Origin-position table (SolidCAM diagram): imaginary tip = per-axis nose corner.
-- Material side by profile winding (signed area) + OD/ID flip.
-- Concave/convex arc offset (R +/- nose), validated numerically earlier.
-- Vanished-element handling for convex features tighter than the nose, with an
-  interference warning surfaced in `problems` (operator owns interference).
+## What still works (verify green on these)
+- All module imports, geom2d self-test (13/13).
+- All four parts CHAIN correctly.
+- comp on LINE-only profiles: bore (ID tip#6) and backface (tip#8) exact.
+- Operation scope: backface span + end-extend -> reference exact.
 
-## The one real bug (NOT in comp - it's in dxf_import)
-The greedy chain builder mis-orders some profiles. On the backface DXF it
-connected non-adjacent endpoints (produced a diagonal not in the DXF) because
-the nearest-neighbour walk + start_hint=origin picked a bad start/order.
-Comp is correct; it was fed a bad chain.
+## The fix (next session)
+Rebuild arc concavity as a LOCAL geometric test, not winding-based. The method
+is already identified and works: offset the arc midpoint along the air-side
+normal by the nose radius; if the resulting tool-center is FARTHER from the arc
+center than the arc radius, the arc is concave (R+nose), else convex (R-nose).
 
-### Fix needed in dxf_import.py
-Make chain building robust: instead of greedy nearest-neighbour from the origin,
-build proper connectivity (match endpoints within tol, follow the unique
-continuation at each node, detect the natural open-chain ends). Then validate
-all four parts import in correct order and re-run the four-way diff end to end
-(DXF -> comp -> compare), which should then match without hand-ordering.
+The weak link found in-session: `_air_normal` returns the wrong side when fed a
+short chord around an arc midpoint. So the rebuild is:
+  1. compute the correct air-side normal AT the arc (from material side, done
+     right for arcs, not via a chord approximation)
+  2. apply the tool-center-distance test above
+Validate against BOTH arc parts at once (part1: one convex R0.15->0.1188 + one
+concave R0.10->0.1312; part2: two concave R0.010->0.0412 + one convex R0.025
+that vanishes). Lock both in verify.py. Only then is verify green and we push.
 
-## Also pending
-- Operation SCOPE: the backface reference cuts only part of the profile (the
-  r1.5 wall + step, not the r2 face). Comp/post needs a way to select which
-  contour span an operation cuts - a job/operation concept above the raw contour.
+## Lesson captured in the update system
+verify.py now exists and gates every push (see UPDATE_SYSTEM.md). This regression
+is exactly what it's for - it surfaced the moment we had a smoke test.

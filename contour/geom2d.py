@@ -227,3 +227,68 @@ def _selftest():
 
 if __name__ == "__main__":
     _selftest()
+
+
+# ---------------------------------------------------------------------------
+# tangent blend (fillet) between two elements meeting at a junction
+# ---------------------------------------------------------------------------
+
+def _line_offsets(p0, p1, R):
+    """Both parallel offsets of a line at distance R."""
+    n = left_normal(sub(p1, p0))
+    a = (add(p0, scale(n, R)), add(p1, scale(n, R)))
+    b = (sub(p0, scale(n, R)), sub(p1, scale(n, R)))
+    return [a, b]
+
+
+def blend_centres(a_kind, a_data, b_kind, b_data, R):
+    """
+    Candidate centres for a fillet of radius R tangent to both elements.
+
+    Works uniformly: offset each element by R on both sides (a line becomes two
+    parallel lines, an arc two concentric circles) and intersect. A centre that
+    is R from both elements is a valid fillet centre.
+
+    a_data / b_data are ((p0,p1)) for a line, (centre, radius) for an arc.
+    """
+    def offs(kind, data):
+        if kind == "line":
+            return [("line", o) for o in _line_offsets(data[0], data[1], R)]
+        c, r = data
+        out = [("arc", (c, r + R))]
+        if r - R > TOL:
+            out.append(("arc", (c, r - R)))
+        return out
+
+    cands = []
+    for ka, da in offs(a_kind, a_data):
+        for kb, db in offs(b_kind, b_data):
+            if ka == "line" and kb == "line":
+                p = intersect_line_line(da[0], da[1], db[0], db[1])
+                if p:
+                    cands.append(p)
+            elif ka == "line" and kb == "arc":
+                cands += intersect_line_circle(da[0], da[1], db[0], db[1])
+            elif ka == "arc" and kb == "line":
+                cands += intersect_line_circle(db[0], db[1], da[0], da[1])
+            else:
+                cands += intersect_circle_circle(da[0], da[1], db[0], db[1])
+    return cands
+
+
+def foot_on_line(pt, p0, p1):
+    """Perpendicular foot of pt on the infinite line through p0,p1."""
+    d = sub(p1, p0)
+    L2 = dot(d, d)
+    if L2 < TOL:
+        return p0
+    t = dot(sub(pt, p0), d) / L2
+    return add(p0, scale(d, t))
+
+
+def point_on_circle_toward(centre, radius, target):
+    """Point on a circle nearest to `target` (the tangent point for a fillet)."""
+    v = sub(target, centre)
+    if length(v) < TOL:
+        return add(centre, (radius, 0.0))
+    return add(centre, scale(unit(v), radius))
