@@ -358,6 +358,16 @@ def make_blend(a, b, radius, tol=1e-6):
         return None
 
     _, centre, ta, tb = best
+
+    # A fillet needs an actual CORNER. Where the two elements already meet
+    # tangentially there is nothing to round: every radius is "tangent to both"
+    # at the existing point, and the result is a full circle sitting in the
+    # toolpath. Reject that rather than emit it.
+    if G.dist(ta, joint) <= tol * 10 and G.dist(tb, joint) <= tol * 10:
+        return None
+    if G.dist(ta, tb) <= tol * 10:
+        return None
+
     # sweep direction: cross product of centre->ta and centre->tb
     va = G.sub(ta, centre)
     vb = G.sub(tb, centre)
@@ -366,6 +376,19 @@ def make_blend(a, b, radius, tol=1e-6):
     arc = Arc(Point(ta[0], ta[1]), Point(tb[0], tb[1]),
               Point(centre[0], centre[1]), direction,
               source_id=None, origin="blend")
+
+    # A corner fillet always sweeps less than half a turn. More than that means
+    # the solver took a centre on the wrong side.
+    a0 = math.atan2(ta[1] - centre[1], ta[0] - centre[0])
+    a1 = math.atan2(tb[1] - centre[1], tb[0] - centre[0])
+    d = a1 - a0
+    while d <= -math.pi:
+        d += 2 * math.pi
+    while d > math.pi:
+        d -= 2 * math.pi
+    if abs(math.degrees(d)) >= 179.0 or abs(math.degrees(d)) < 1e-6:
+        return None
+
     return _trim_to(a, ta, True), arc, _trim_to(b, tb, False)
 
 

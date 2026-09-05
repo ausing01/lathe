@@ -315,6 +315,19 @@ def main():
     if not m or len(m) != len(both.elements):
         fails.append("assemble should expose one meta entry per element")
 
+    # A TANGENT junction has no corner to fillet. Every radius is "tangent to
+    # both" at the existing point, and the solver used to return a full circle
+    # for it - that would have gone straight into a toolpath.
+    tan_a, tan_b = cs.elements[4], cs.elements[5]      # arc meeting a line
+    for R in (0.05, 2.0, 9.0):
+        if make_blend(tan_a, tan_b, R) is not None:
+            fails.append(f"a tangent junction should refuse a blend, R{R} fitted")
+    if max_blend_radius(tan_a, tan_b) > TOL:
+        fails.append("a tangent junction should report no fitting radius")
+    # and a real corner is unaffected
+    if make_blend(cs.elements[2], cs.elements[3], 0.05) is None:
+        fails.append("a real corner should still accept a blend")
+
     # an oversized radius must be reported, not silently mangled
     big, bnotes = assemble(cs, order, blends={blend_key(2, 3): 5.0})
     if any(is_blend(e) for e in big.elements):
@@ -613,6 +626,93 @@ def main():
     if not any("does not meet the stock" in x for x in n4):
         fails.append(f"a profile that misses the stock should report it, "
                      f"got {n4}")
+
+    # SESSION - the editing state in Python, so a UI port rewrites the view only
+    from contour.session import Session, ExtSeg
+    ss = Session()
+    if ss.view()["rows"]:
+        fails.append("a fresh session should have no chain")
+    # chain by clicks
+    ss.click_element(2)
+    if ss.order is not None:
+        fails.append("one click should not resolve a chain")
+    ss.click_element(5)
+    if ss.order != [2, 3, 4, 5]:
+        fails.append(f"two clicks should chain 2..5, got {ss.order}")
+    ss.click_element(8)
+    if ss.order != [2, 3, 4, 5, 6, 7, 8]:
+        fails.append(f"clicking outside should extend, got {ss.order}")
+    # reverse and trim operate on the displayed ends
+    ss.select_all()
+    before = ss.shown_order()
+    ss.reverse()
+    if ss.shown_order() != list(reversed(before)):
+        fails.append("reverse should flip the displayed order")
+    ss.reverse()
+    ss.delete_end("start")
+    if ss.shown_order()[0] == before[0]:
+        fails.append("delete start should drop the first displayed element")
+    # unchecking bridges, and the row list keeps the unchecked element
+    ss.select_all()
+    ss.toggle(2); ss.toggle(3)
+    rw = ss.view()["rows"]
+    if not any(r["cls"] == "bridge" for r in rw):
+        fails.append("unchecking should produce a bridge row")
+    if not any(r["key"] == "2" and r["check"] is False for r in rw):
+        fails.append("an unchecked element must stay listed and checkable")
+    # blends, including the unfittable report
+    ss.select_all()
+    ss.set_blend(blend_key(2, 3), 0.05)
+    if not any(r["cls"] == "blend" for r in ss.view()["rows"]):
+        fails.append("a fitting blend should appear as a row")
+    ss.set_blend(blend_key(2, 3), 5.0)
+    if "2-3" not in ss.view()["blend_errors"]:
+        fails.append("an unfittable blend should be reported by the session")
+    ss.set_blend(blend_key(2, 3), 0)
+    # extensions and the cut-end triangles
+    ss.stock_od, ss.stock_zf, ss.stock_zb = 6.0, 0.2, -4.3
+    ss.start_segs[0] = ExtSeg("+Z")
+    ss.end_segs[0] = ExtSeg("+X")
+    v = ss.view()
+    if sum(1 for r in v["rows"] if r["cls"] == "ext") != 2:
+        fails.append("two extension rows expected")
+    if v["svg"].count("<polygon") != 2:
+        fails.append("two cut-end triangles expected")
+    # the stock boundary walk accumulates across clicks
+    ss.click_stock((0.2, 1.5))
+    w1 = ss.view()["walk_rows"]
+    ss.click_stock((-4.3, 1.5))
+    w2 = ss.view()["walk_rows"]
+    if len(w1) != 2 or len(w2) <= len(w1):
+        fails.append(f"the walk should accumulate: {len(w1)} then {len(w2)}")
+    ss.clear_walk()
+    if ss.view()["walk_rows"]:
+        fails.append("clear_walk should empty the walk")
+    # a malformed focus key must not raise
+    ss.focus = "undefined"
+    if ss.view()["props"] is not None:
+        fails.append("an unrecognised focus should select nothing")
+
+    # PAGE SCRIPT - a literal newline inside a JS string kills the whole
+    # script silently: the page loads, nothing runs, and it sits on "loading".
+    # Cheap to check, so check it.
+    import re as _re
+    import importlib as _il
+    try:
+        _srv = _il.import_module("serve")
+        _js = _re.search(r"<script>(.*?)</script>", _srv.PROFILE_PAGE,
+                         _re.S).group(1)
+        for line in _js.split(chr(10)):
+            if line.count(chr(39)) % 2:
+                fails.append(f"page script: unterminated ' in {line.strip()[:60]}")
+                break
+        for line in _js.split(chr(10)):
+            if line.count(chr(96)) % 2:
+                fails.append(f"page script: unterminated backtick in "
+                             f"{line.strip()[:60]}")
+                break
+    except Exception as _e:
+        fails.append(f"could not check the page script: {_e}")
 
     if fails:
         print("\nFAILURES:")
