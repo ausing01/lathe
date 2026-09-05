@@ -132,3 +132,59 @@ def post_finish(contour, cfg, out=None):
     if out:
         open(out, "w").write(text)
     return text
+
+
+def post_rough(moves, cfg, notes=(), out=None):
+    """
+    Emit roughing moves as LinuxCNC G-code.
+
+    `moves` come from rough.rough(): alternating rapids and feeds in (z, r).
+    Radius becomes diameter here, as everywhere else in the post - this stays
+    the only place that conversion happens.
+    """
+    L = []
+    def emit(s=""):
+        L.append(s)
+
+    emit(f"({cfg.program_name} - LinuxCNC roughing)")
+    for n in notes:
+        emit(f"({n})")
+    emit("G20" if cfg.units == "inch" else "G21")
+    emit("G18")
+    emit("G7" if cfg.diameter_mode else "G8")
+    emit("G40 G54")
+    emit("G95")
+    if cfg.css:
+        emit(f"G96 D{_ifmt(cfg.css_max_rpm)} S{_ifmt(cfg.surface_speed)} M3")
+    else:
+        emit(f"G97 S{_ifmt(cfg.rpm)} M3")
+    if cfg.coolant:
+        emit("M8")
+    emit()
+
+    feeding = False
+    for m in moves:
+        x = _fmt(_x(m.r, cfg))
+        z = _fmt(m.z)
+        if m.kind == "rapid":
+            emit(f"G0 X{x} Z{z}")
+            feeding = False
+        else:
+            if not feeding:
+                emit(f"G1 X{x} Z{z} F{_fmt(cfg.feed_per_rev)}")
+                feeding = True
+            else:
+                emit(f"G1 X{x} Z{z}")
+
+    emit()
+    emit(f"G0 X{_fmt(_x(cfg.retract_r, cfg))}")
+    if cfg.coolant:
+        emit("M9")
+    emit("M5")
+    emit(f"G53 G0 X{_fmt(0.0)} Z{_fmt(0.0)}")
+    emit("M2")
+
+    text = "\n".join(L) + "\n"
+    if out:
+        open(out, "w").write(text)
+    return text

@@ -181,7 +181,7 @@ def render_pickable(contour, selected=(), extended=None, stock=None,
                     width=900, title=None, height_cap=520,
                     start_dot=None, end_dot=None,
                     focus=None, focus_element=None,
-                    start_tri=None, end_tri=None):
+                    start_tri=None, end_tri=None, walk=None):
     """
     Draw a contour with each element as its own <path data-idx="i">, so the page
     can attach click handlers and toggle selection.
@@ -220,8 +220,8 @@ def render_pickable(contour, selected=(), extended=None, stock=None,
     P = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
          f'height="{height}" viewBox="0 0 {width} {height}" id="pickfig">',
          '<rect width="100%" height="100%" fill="#fdfdfd"/>',
-         f'<g transform="translate({-z0*scale:.3f},{r1*scale:.3f}) '
-         f'scale({scale:.5f},{-scale:.5f})">']
+         f'<g id="modelspace" transform="translate({-z0*scale:.3f},'
+         f'{r1*scale:.3f}) scale({scale:.5f},{-scale:.5f})">']
 
     def sw(px):
         return px / scale
@@ -231,19 +231,18 @@ def render_pickable(contour, selected=(), extended=None, stock=None,
     P.append(f'<line x1="{z0:.4f}" y1="0" x2="{z1:.4f}" y2="0" stroke="{s}" '
              f'stroke-width="{sw(w):.5f}" stroke-dasharray="{dash}"/>')
 
-    # stock
+    # stock, with a hit target per element so it can be clicked
     if stock is not None:
         s, w, dash = STYLES["stock"]
         d = _contour_path(stock.contour)
         if d:
             P.append(f'<path d="{d}" fill="none" stroke="{s}" '
                      f'stroke-width="{sw(w):.5f}" stroke-dasharray="{dash}"/>')
-        s, w, _ = STYLES["open"]
         for i, e in enumerate(stock.contour.elements):
-            if stock.is_open(i):
-                P.append(f'<path d="{_element_path(e)}" fill="none" '
-                         f'stroke="{s}" stroke-width="{sw(w):.5f}" '
-                         f'stroke-linecap="round"/>')
+            P.append(f'<path d="{_element_path(e)}" fill="none" '
+                     f'stroke="transparent" stroke-width="{sw(14):.5f}" '
+                     f'stroke-linecap="round" class="shit" data-sidx="{i}" '
+                     f'style="cursor:crosshair"/>')
 
     # extended profile (drawn under the pickable elements)
     if extended is not None:
@@ -253,6 +252,13 @@ def render_pickable(contour, selected=(), extended=None, stock=None,
             P.append(f'<path d="{d}" fill="none" stroke="{s}" '
                      f'stroke-width="{sw(w):.5f}" stroke-linecap="round" '
                      f'stroke-linejoin="round" opacity="0.55"/>')
+
+    # the chosen stock boundary walk
+    if walk:
+        for e in walk:
+            P.append(f'<path d="{_element_path(e)}" fill="none" '
+                     f'stroke="#1d9b1d" stroke-width="{sw(3.4):.5f}" '
+                     f'stroke-linecap="round" style="pointer-events:none"/>')
 
     # focus halo, drawn under everything so the element still reads normally
     halo = None

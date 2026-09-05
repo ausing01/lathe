@@ -1,41 +1,56 @@
-# comp.py status - ARC CONCAVITY REBUILD PENDING (known regression)
+# comp.py - GREEN. Explicit comp side, winding inference removed.
 
-## Current state: verify.py is RED on the two arc parts
-The chain-builder fix (last session) changed element ordering/direction to the
-CORRECT tight-tolerance chaining. comp's arc concave/convex test was written
-against the OLD (loose-tolerance) ordering and is now wrong for arcs.
+## The fix
+Material side is no longer inferred from contour winding. It is an explicit
+G41/G42-style flag, relative to direction of travel:
 
-verify.py reports:
-  - part1 comp arc radii [0.0688, 0.1813], want [0.1188, 0.1312]
-  - part2 comp arcs [0.0562], want an R~0.0412
-Both are the SAME bug: `_arc_is_concave` uses global contour winding, which only
-worked by coincidence for the old ordering. Concavity is a LOCAL property.
+| `comp_side` | Meaning | G-code equivalent |
+|---|---|---|
+| `"left"` | tool to the LEFT of travel - boring, tool inside | G41 |
+| `"right"` | tool to the RIGHT of travel - turning, tool outside | G42 |
+| `"center"` | no offset, follow the geometry exactly | G40 |
 
-IMPORTANT: this regression is already in the committed repo (it went in with the
-chain-builder commit, before verify.py existed to catch it). The line-only parts
-(bore, backface) are unaffected and remain correct.
+On a line running Z0 to Z-1 at X1, left puts the tool at smaller radius (inside
+the hole) and right at larger radius (outside the diameter).
 
-## What still works (verify green on these)
-- All module imports, geom2d self-test (13/13).
-- All four parts CHAIN correctly.
-- comp on LINE-only profiles: bore (ID tip#6) and backface (tip#8) exact.
-- Operation scope: backface span + end-extend -> reference exact.
+Reversing the chain swaps which physical side is cut, exactly as swapping G41
+and G42 would. That is deliberate and matches control behaviour.
 
-## The fix (next session)
-Rebuild arc concavity as a LOCAL geometric test, not winding-based. The method
-is already identified and works: offset the arc midpoint along the air-side
-normal by the nose radius; if the resulting tool-center is FARTHER from the arc
-center than the arc radius, the arc is concave (R+nose), else convex (R-nose).
+The offset is baked into the coordinates and the machine stays in G40. Emitting
+G41/G42 instead would be a post-processor flag with no geometry consequence,
+since the same setting drives both.
 
-The weak link found in-session: `_air_normal` returns the wrong side when fed a
-short chord around an arc midpoint. So the rebuild is:
-  1. compute the correct air-side normal AT the arc (from material side, done
-     right for arcs, not via a chord approximation)
-  2. apply the tool-center-distance test above
-Validate against BOTH arc parts at once (part1: one convex R0.15->0.1188 + one
-concave R0.10->0.1312; part2: two concave R0.010->0.0412 + one convex R0.025
-that vanishes). Lock both in verify.py. Only then is verify green and we push.
+## Why the old approach failed
+Winding could not distinguish a front face from a back face. Each polarity of
+the rule made one group of parts exact and the other wrong by exactly 2 x nose
+radius, because the discriminator itself was wrong rather than its sign.
 
-## Lesson captured in the update system
-verify.py now exists and gates every push (see UPDATE_SYSTEM.md). This regression
-is exactly what it's for - it surfaced the moment we had a smoke test.
+## Validation - all four references
+| part | side | result |
+|---|---|---|
+| part 1 | right | exact; arc radii 0.11875 and 0.13125 |
+| part 2 | right | exact on straight moves and arc radii |
+| bore | left | EXACT, all points, 0.0000 |
+| backface | right | EXACT, all points, 0.0000 |
+
+Arc radii are exactly `0.15 - nose` and `0.10 + nose`. The reference prints
+`0.1188` and `0.1312`, which are those same numbers at four decimals.
+
+## Two legitimate differences from the references, not comp errors
+1. The reference programs print 4 decimals, so their own quantisation is
+   +/-0.00005 in diameter.
+2. The references were cut with full DNMG insert geometry (~2 deg face
+   clearance), not a pure nose-radius circle. That shifts points ADJACENT TO
+   ARCS by up to ~0.00013 in radius, and on part 2 blends the corner into one
+   arc where a nose-radius model correctly gives two.
+
+Straight elements away from arcs, and the arc radii themselves, match exactly.
+`verify.py` uses REF_TOL = 0.0003 on diameter for CAM comparisons and TOL =
+0.0001 for pure geometry, with both figures reported on a pass.
+
+## Relationship to the material region
+The stock region (profile + extensions + a walk along the stock boundary) still
+has value for roughing extents, retract planes and the simulator. It should
+CROSS-CHECK the comp side, not determine it: if the flag says left and the
+region says material is on the right, that is worth warning about before cutting.
+One mechanism, one source of truth.

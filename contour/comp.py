@@ -33,6 +33,11 @@ TIP_OFFSET = {
 }
 
 
+COMP_LEFT = "left"       # G41 - tool to the LEFT of travel   (bore)
+COMP_RIGHT = "right"     # G42 - tool to the RIGHT of travel  (turning)
+COMP_CENTER = "center"   # G40 - no offset, follow the line exactly
+
+
 def _signed_area(contour):
     pts = [(e.start.z, e.start.r) for e in contour.elements]
     pts.append((contour.elements[-1].end.z, contour.elements[-1].end.r))
@@ -43,22 +48,29 @@ def _signed_area(contour):
     return a / 2.0
 
 
-def _air_normal(p0, p1, contour_ccw, side):
+def _tool_normal(p0, p1, comp_side):
     """
-    Unit normal pointing to the AIR side of a segment p0->p1.
+    Unit normal pointing to the TOOL side of a segment p0->p1.
 
-    For a profile walked CCW in (z right, r up), the enclosed material lies to
-    the LEFT of travel, so air is the RIGHT normal; walked CW it is the reverse.
-    Verified on straight OD diameters: the nose centre must ride OUTWARD (larger
-    r) on an OD cut, for both CW-walked profiles (part 1, part 2) and CCW-walked
-    ones (backface). ID flips, since the material is outside the bore profile.
+    This is the G41/G42 convention, relative to direction of travel:
+
+      left   tool to the LEFT of travel   (G41) - a bore, tool inside
+      right  tool to the RIGHT of travel  (G42) - turning, tool outside
+
+    On a line running Z0 to Z-1 at X1, left puts the tool at smaller radius
+    (inside the hole) and right at larger radius (outside the diameter), which
+    is what those words mean at the machine.
+
+    Travel-relative means reversing the chain swaps which physical side is cut,
+    exactly as swapping G41 and G42 would. That is deliberate.
+
+    Replaces the old winding-based inference, which could not tell a front face
+    from a back face and was wrong on some profiles.
     """
     n_left = G.left_normal(G.sub(p1, p0))
-    n_right = (-n_left[0], -n_left[1])
-    air = n_right if contour_ccw else n_left
-    if side == Side.ID:
-        air = (-air[0], -air[1])
-    return air
+    if comp_side == COMP_RIGHT:
+        return (-n_left[0], -n_left[1])
+    return n_left
 
 
 def _arc_mid_tangent(e):
@@ -80,7 +92,7 @@ def _arc_mid_tangent(e):
     return mid, tang
 
 
-def _arc_is_concave(arc, contour_ccw, side):
+def _arc_is_concave(arc, comp_side):
     """
     Concave (offset radius GROWS) vs convex (SHRINKS), decided locally.
 
@@ -99,24 +111,24 @@ def _arc_is_concave(arc, contour_ccw, side):
     """
     mid, tang = _arc_mid_tangent(arc)
     n_left = G.left_normal(tang)
-    n_right = (-n_left[0], -n_left[1])
-    air = n_right if contour_ccw else n_left
-    if side == Side.ID:
-        air = (-air[0], -air[1])
+    air = (-n_left[0], -n_left[1]) if comp_side == COMP_RIGHT else n_left
     bulge = G.unit(G.sub(mid, (arc.center.z, arc.center.r)))
-    return G.dot(air, bulge) < 0
+    # The tool centre offsets along `air` (the tool-side normal). If that points
+    # the same way as the outward bulge, the centre rides outside the arc and
+    # the swept radius GROWS - that is the concave case (R + nose). Pointing
+    # inward shrinks it (R - nose), the convex case.
+    return G.dot(air, bulge) > 0
 
 
-def _offset_element(e, nose, contour_ccw, side):
+def _offset_element(e, nose, comp_side):
     if e.kind == "line":
-        n = _air_normal((e.start.z, e.start.r), (e.end.z, e.end.r),
-                        contour_ccw, side)
+        n = _tool_normal((e.start.z, e.start.r), (e.end.z, e.end.r), comp_side)
         shift = G.scale(n, nose)
         return {'kind': 'line',
                 'p0': G.add((e.start.z, e.start.r), shift),
                 'p1': G.add((e.end.z, e.end.r), shift)}
     else:
-        concave = _arc_is_concave(e, contour_ccw, side)
+        concave = _arc_is_concave(e, comp_side)
         new_r = G.offset_arc_radius(e.radius, nose, concave)
         if new_r is None:
             return {'kind': 'vanished', 'orig': e}
@@ -146,15 +158,33 @@ def _reintersect(a, b):
     return None
 
 
-def compensate(contour, nose_radius, tip):
+def compensate(contour, nose_radius, tip, comp_side=COMP_RIGHT):
+    """
+    Offset a contour by the tool nose radius onto the driven tip.
+
+    comp_side is the G41/G42 convention, relative to direction of travel:
+      "left"    tool left of travel  (G41) - boring
+      "right"   tool right of travel (G42) - turning
+      "center"  no offset (G40) - follow the geometry exactly
+
+    Reversing the chain swaps which physical side is cut, exactly as swapping
+    G41 and G42 would. The offset is baked into the coordinates; the machine
+    stays in G40.
+    """
     if tip not in TIP_OFFSET:
         raise ValueError(f"unknown tip code {tip}")
+    if comp_side not in (COMP_LEFT, COMP_RIGHT, COMP_CENTER):
+        raise ValueError(f"comp_side must be left, right or center, "
+                         f"got {comp_side!r}")
     problems = []
     nose = nose_radius
-    ccw = _signed_area(contour) > 0
 
-    raw = [_offset_element(e, nose, ccw, contour.side)
-           for e in contour.elements]
+    if comp_side == COMP_CENTER:
+        out = Contour(elements=list(contour.elements), side=contour.side,
+                      closed=contour.closed, name=contour.name + "_comp")
+        return out, problems
+
+    raw = [_offset_element(e, nose, comp_side) for e in contour.elements]
 
     offs = []
     for i, o in enumerate(raw):

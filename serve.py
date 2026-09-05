@@ -20,14 +20,15 @@ import json
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from contour.stock import parametric
+from contour.stock import parametric, from_dxf, from_contour
+from contour.region import stock_click
 from contour.extend import (Extension, extend_profile,
                             blend_extensions, extension_junctions)
 from contour.select import (auto_chain, manual, check_selection,
                             assemble, is_bridge, is_blend, blend_key)
 from contour.viz import render, render_pickable
 from contour.dxf_import import import_dxf
-from contour.comp import compensate
+from contour.comp import compensate, COMP_LEFT, COMP_RIGHT, COMP_CENTER
 from contour.model import Side
 
 PORT = 8321
@@ -199,6 +200,8 @@ PROFILE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .el.ext{background:#eef7ee;border-color:#cfe6cf;color:#2a6b2a}
  .el.bridge{background:#fff6e6;border-color:#f0dcb8;color:#8a6412}
  .el.blend{background:#eef2fb;border-color:#c8d4ee;color:#33509c}
+ .el.stock{background:#f6f6f6;border-color:#e0e0e0;color:#555}
+ .el.stockopen{background:#eefaee;border-color:#bfe3bf;color:#1d661d}
  .el.nopick{cursor:pointer}
  .el .pad{display:inline-block;width:15px}
  .el input{margin:0 4px 0 0}
@@ -227,12 +230,22 @@ PROFILE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <nav><a href="/">stock</a><a href="/profile">profile</a><a href="/parts">reference parts</a></nav>
 
 <div class="row">
- <label>part<select id="part">
+ <label>profile<select id="part">
   <option value="part1">part1 (open, 9)</option>
   <option value="part2">part2 (open, 7)</option>
   <option value="bore">bore (open, 4)</option>
   <option value="backface">backface (open, 3)</option>
   <option value="stock_closed">stock_closed (CLOSED, 4)</option>
+ </select></label>
+ <label>stock<select id="stocksrc">
+  <option value="param">parametric</option>
+  <option value="stock_closed">stock_closed.dxf</option>
+  <option value="none">none</option>
+ </select></label>
+ <label>comp side<select id="cside">
+  <option value="right">right (turning)</option>
+  <option value="left">left (boring)</option>
+  <option value="center">center (no comp)</option>
  </select></label>
  <label>stock OD<input id="od" value="5.5"></label>
  <label>z face<input id="zf" value="0.15"></label>
@@ -268,6 +281,13 @@ PROFILE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   </div>
   <div class="ends" id="hint">top = start &nbsp;&middot;&nbsp; bottom = end</div>
   <div id="list"></div>
+  <h2 style="margin-top:12px">stock boundary</h2>
+  <div class="ends" id="stockhint">click the stock beside an extension,
+   on the side you want it to run</div>
+  <div class="row" style="gap:4px;margin:4px 0">
+   <button id="swclear">clear walk</button>
+  </div>
+  <div id="stocklist"></div>
  </div>
  <div class="panel">
   <div id="out">loading...</div>
@@ -308,7 +328,8 @@ function setHint(){
 async function loadPart(){
  const r=await fetch('/pick_meta.json?part='+part.value); const j=await r.json();
  N=j.n; SEL=[...Array(N).keys()]; A=null; B=null; FOCUS=null;
- ORDER=null; OFF=new Set(); FLIP=false; BLENDS={}; go();
+ ORDER=null; OFF=new Set(); FLIP=false; BLENDS={};
+ SCLICKS=[]; go();
 }
 function ext(pfx){
  const d=document.getElementById(pfx+'d').value;
@@ -319,7 +340,11 @@ function ext(pfx){
 async function go(){
  setHint();
  const q=new URLSearchParams({part:part.value,od:od.value,zf:zf.value,zb:zb.value,
-  mode:'auto', rev:0, stock:STOCK?1:0});
+  mode:'auto', rev:0, stock:STOCK?1:0,
+  stocksrc:stocksrc.value, cside:cside.value,
+  });
+ if(SCLICKS.length)
+  q.set('sclicks', SCLICKS.map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join(';'));
  q.set('s1', ext('s'));
  q.set('s2', segOf(null,'sl2','sa2'));
  q.set('e1', ext('e'));
@@ -337,6 +362,8 @@ async function go(){
  out.innerHTML=j.svg||''; info.textContent=j.info||j.error||'';
  if(ORDER===null && j.order && j.order.length) ORDER=j.order.slice();
  ROWS=j.rows||[]; BERR=j.blend_errors||{};
+ SROWS=j.stock_rows||[];
+ renderStock(SROWS);
  renderList(ROWS);
  pruneBlends();
  renderProps(j.props);
@@ -370,7 +397,9 @@ function renderList(rows){
  for(const el of document.querySelectorAll('.el'))
   el.addEventListener('click',ev=>{
    if(ev.target.classList.contains('cb')) return;
-   FOCUS=el.dataset.el; go();
+   const v=el.dataset.el;
+   if(v===undefined||v==='') return;
+   FOCUS=v; go();
   });
  for(const cb of document.querySelectorAll('.cb'))
   cb.addEventListener('change',()=>{
@@ -379,7 +408,8 @@ function renderList(rows){
    go();
   });
 }
-let ROWS=[], BERR={};
+let ROWS=[], BERR={}, SROWS=[];
+let SCLICKS=[];   // stock boundary walk: the click history, replayed
 function jkeyOf(rowKey){
  const r=ROWS.find(x=>String(x.key)===String(rowKey));
  return r? (r.jkey||null) : null;
@@ -419,6 +449,24 @@ function updateBlendBox(){
     ' \u00b7 stays put if the chain is reversed';
  }
 }
+function renderStock(rows){
+ // the list shows the CHAINED boundary, in walk order - not every stock element
+ if(!rows || rows.length===0){
+  stocklist.innerHTML='<div class="ends">nothing chained yet</div>'; return; }
+ let h='';
+ rows.forEach((r,k)=>{
+  const cls=['el','stock',String(FOCUS)===('s'+k)?'focus':''].filter(Boolean).join(' ');
+  h+=`<div class="${cls}" data-sel="${k}"><span>${k}</span>`
+   +`<span class="tag">${r.label}</span></div>`;
+ });
+ stocklist.innerHTML=h;
+ for(const el of document.querySelectorAll('[data-sel]'))
+  el.addEventListener('click',()=>{
+   const v=el.dataset.sel;
+   if(v===undefined||v==='') return;
+   FOCUS='s'+v; go();
+  });
+}
 function renderProps(p){
  updateBlendBox();
  if(!p){props.textContent='click an element';return;}
@@ -450,7 +498,28 @@ function renderProps(p){
  h+='</table>';
  props.innerHTML=h;
 }
+function modelPoint(ev){
+ // clicks arrive in screen space; the drawing group carries the transform, so
+ // inverting ITS matrix gives part coordinates directly
+ const svg=document.getElementById('pickfig');
+ const g=document.getElementById('modelspace');
+ if(!svg||!g) return null;
+ const p=svg.createSVGPoint();
+ p.x=ev.clientX; p.y=ev.clientY;
+ const m=g.getScreenCTM();
+ if(!m) return null;
+ const q=p.matrixTransform(m.inverse());
+ return [q.x,q.y];
+}
 function attach(){
+ for(const h of document.querySelectorAll('.shit')){
+  h.addEventListener('click',ev=>{
+   const pt=modelPoint(ev);
+   if(!pt) return;
+   SCLICKS.push(pt);
+   go();
+  });
+ }
  for(const h of document.querySelectorAll('.hit')){
   h.addEventListener('click',()=>{
    const i=parseInt(h.dataset.idx);
@@ -506,9 +575,11 @@ blendr.addEventListener('keydown',ev=>{
 document.getElementById('blendclr').addEventListener('click',()=>{
  const key=jkeyOf(FOCUS); if(!key) return;
  delete BLENDS[key]; blendr.value=''; go();});
+document.getElementById('swclear').addEventListener('click',()=>{
+ SCLICKS=[]; go();});
 part.addEventListener('change',loadPart);
 for(const e of ['od','zf','zb','sd','sl','sa','sl2','sa2',
-                'ed','el','ea','el2','ea2'])
+                'ed','el','ea','el2','ea2','stocksrc','cside'])
  document.getElementById(e).addEventListener('input',go);
 loadPart();
 </script></body></html>"""
@@ -790,9 +861,9 @@ def _rows(final, idx):
 
 def _focus_props_row(q, c, final, idx):
     """Properties for the focused row: a contour index, or x<pos> in the
-    assembled cut sequence."""
+    assembled cut sequence. Stock rows (s...) are handled separately."""
     f = q.get("focus", [None])[0]
-    if f is None:
+    if f is None or (not f.startswith("x") and not f.lstrip("-").isdigit()):
         return None
     if f.startswith("x"):
         pos = int(f[1:])
@@ -803,9 +874,34 @@ def _focus_props_row(q, c, final, idx):
     return _props(c.elements[i], i) if 0 <= i < len(c.elements) else None
 
 
-def _focus_props(q, c):
+def _walk_rows(walk):
+    """One row per element of the chosen boundary walk, in walk order."""
+    out = []
+    for i, e in enumerate(walk):
+        pr = _props(e, i)
+        shape = (f"line {_fmt_ang(pr['angle_from_axis'])}\u00b0"
+                 if e.kind == "line"
+                 else f"arc R{pr['radius']:.4f} {pr['direction']}")
+        src = "" if e.source_id is None else f" src{e.source_id}"
+        out.append({"index": i,
+                    "label": f"{shape}  len {pr['length']:.4f}{src}"})
+    return out
+
+
+def _walk_focus_props(q, walk):
+    """Properties for a focused WALK element, keyed s<position>."""
     f = q.get("focus", [None])[0]
-    if f is None:
+    if f is None or not f.startswith("s") or not f[1:].isdigit():
+        return None
+    i = int(f[1:])
+    return _props(walk[i], i) if 0 <= i < len(walk) else None
+
+
+def _focus_props(q, c):
+    """Properties for a focused PROFILE element. Synthetic keys (x...) and
+    stock keys (s...) are handled elsewhere, so ignore them here."""
+    f = q.get("focus", [None])[0]
+    if f is None or not f.lstrip("-").isdigit():
         return None
     i = int(f)
     return _props(c.elements[i], i) if 0 <= i < len(c.elements) else None
@@ -819,10 +915,16 @@ def profile_svg(q):
     want_stock = q.get("stock", ["1"])[0] == "1"
 
     st = None
-    if want_stock:
-        st = parametric(od=float(q.get("od", ["5.5"])[0]),
-                        z_face=float(q.get("zf", ["0.15"])[0]),
-                        z_back=float(q.get("zb", ["-4.2"])[0]))
+    src = q.get("stocksrc", ["param"])[0]
+    if want_stock and src != "none":
+        if src == "param":
+            st = parametric(od=float(q.get("od", ["5.5"])[0]),
+                            z_face=float(q.get("zf", ["0.15"])[0]),
+                            z_back=float(q.get("zb", ["-4.2"])[0]))
+        else:
+            sc, _sp = from_dxf(f"tests/{src}.dxf", name=src)
+            st = sc
+        # open edges are no longer toggled; the boundary walk defines them
 
     notes = []
 
@@ -932,6 +1034,7 @@ def _blends(q):
 
 
 def _finish(q, c, name, st, sel, idx, order, how, probs_extra=(), off=()):
+    comp_side = q.get("cside", ["right"])[0]
     notes = list(probs_extra)
     probs = check_selection(sel)
     ext = None
@@ -953,20 +1056,45 @@ def _finish(q, c, name, st, sel, idx, order, how, probs_extra=(), off=()):
             notes.append(f"extension ERROR: {err}")
             ext = None
 
+    # boundary walk: one click advances it, and it stops at the next
+    # profile/stock intersection
+    walk, walk_end = [], None
+    src_for_walk = ext if ext is not None else sel
+    raw = q.get("sclicks", [""])[0]
+    if st is not None and raw.strip():
+        for step in raw.split(";"):
+            if not step.strip():
+                continue
+            try:
+                cz, cr = [float(x) for x in step.split(",")]
+            except ValueError:
+                continue
+            seg, walk_end, wnotes = stock_click(st, src_for_walk, (cz, cr),
+                                                chain_end_s=walk_end)
+            notes += wnotes
+            if not seg:
+                break
+            walk += seg
+
     sd = (sel.elements[0].start.z, sel.elements[0].start.r)
     ed = (sel.elements[-1].end.z, sel.elements[-1].end.r)
     fkey = q.get("focus", [None])[0]
     f_idx, f_el = None, None
     if fkey is not None:
-        if fkey.startswith("x"):
+        if fkey.startswith("s") and fkey[1:].isdigit():
+            si = int(fkey[1:])
+            if 0 <= si < len(walk):
+                f_el = walk[si]
+        elif fkey.startswith("x") and fkey[1:].isdigit():
             fp = int(fkey[1:])
             src = ext if ext is not None else sel
             if 0 <= fp < len(src.elements):
                 f_el = src.elements[fp]
-        else:
+        elif fkey.lstrip("-").isdigit():
             fi = int(fkey)
             if 0 <= fi < len(c.elements):
                 f_idx = fi
+        # anything else (a stale or malformed key) simply focuses nothing
     # Triangles mark the extreme ends of the CUT: only the outermost extension
     # at each end, not every segment.
     stri = etri = None
@@ -983,7 +1111,7 @@ def _finish(q, c, name, st, sel, idx, order, how, probs_extra=(), off=()):
                           title=f"{name} - {how}",
                           start_dot=sd, end_dot=ed,
                           focus=f_idx, focus_element=f_el,
-                          start_tri=stri, end_tri=etri)
+                          start_tri=stri, end_tri=etri, walk=walk)
 
     final = ext or sel
     rows = _rows_full(c, final, order, set(off),
@@ -1010,9 +1138,14 @@ def _finish(q, c, name, st, sel, idx, order, how, probs_extra=(), off=()):
             errs[wire] = {"asked": v["asked"], "max": round(v["max"], 4),
                           "where": v.get("where", wire)}
 
+    if props is None:
+        props = _walk_focus_props(q, walk)
+
     return {"svg": svg, "info": info, "order": order,
             "labels": labels, "props": props, "rows": rows,
-            "blend_errors": errs}
+            "blend_errors": errs,
+            "stock_rows": _walk_rows(walk),
+            "walk_end": walk_end}
 
 
 def indices_for_chain(c, si, ei, forward):
@@ -1054,9 +1187,11 @@ class H(BaseHTTPRequestHandler):
             for name, (path, side, tip, nose) in PARTS.items():
                 try:
                     c, _ = import_dxf(path, side=side, name=name)
-                    cm, probs = compensate(c, nose, tip)
+                    side = COMP_LEFT if name == "bore" else COMP_RIGHT
+                    cm, probs = compensate(c, nose, tip, comp_side=side)
                     svg = render([("profile", c, "part profile"),
-                                  ("tool", cm, f"comp tip#{tip} nose{nose}")],
+                                  ("tool", cm,
+                                   f"comp tip#{tip} nose{nose} {side}")],
                                  width=860, title=name)
                     note = ("\n".join(probs)) if probs else ""
                     body.append(f"<h2>{name}</h2><div class='card'>{svg}</div>"
